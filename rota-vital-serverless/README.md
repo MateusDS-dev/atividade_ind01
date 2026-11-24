@@ -1,0 +1,95 @@
+# Rota Vital · Função serverless (guia de transporte)
+
+Atividade individual 1 · Infraestrutura de Software · ADS · CESAR School · 2026.2
+Autor: Mateus Henrique Diniz Silva
+
+Função serverless acionada por evento e por HTTP que recebe uma requisição do Rota Vital e devolve a guia de transporte.
+
+## Caminho escolhido
+
+**Caminho A: AWS SAM CLI local** (Docker + SAM CLI + Python 3.12), sem conta na AWS e sem publicar na nuvem.
+
+## Estrutura
+
+```
+template.yaml          # API POST /guias, Timeout em Globals, 128 MB
+hello_world/app.py     # handler (lê o body, gera a guia, contador global)
+events/pedido.json     # evento no formato API Gateway proxy
+evidencias/            # prints dos comandos e saídas
+```
+
+## Como rodar
+
+Pré-requisitos: Docker rodando, `sam --version` funcionando, Python 3.12. No Windows, usar Git Bash ou WSL.
+
+```bash
+# 1. Build
+sam build
+
+# 2. Invocar com evento (rodar duas vezes e anotar o tempo)
+sam local invoke -e events/pedido.json
+
+# 3. Gatilho HTTP
+sam local start-api
+# em outro terminal, três vezes:
+curl -X POST http://127.0.0.1:3000/guias -H "Content-Type: application/json" \
+  -d '{"requisicaoId":"R-002","hospital":"H-Caruaru"}'
+
+# 4. Reaproveitamento do ambiente
+# parar o servidor (Ctrl+C) e subir de novo:
+sam local start-api --warm-containers LAZY
+# repetir os três curls
+
+# 5. Limite de tempo (Timeout = 3 no template)
+curl -X POST http://127.0.0.1:3000/guias -H "Content-Type: application/json" \
+  -d '{"requisicaoId":"R-003","demorar":true}'
+# depois: Timeout: 10 no template.yaml, sam build, repetir o curl
+```
+
+O evento `events/pedido.json` foi gerado no formato que o API Gateway envia ao Lambda (equivalente a `sam local generate-event apigateway aws-proxy --method POST --path guias --body '...'`).
+
+## Resultados observados
+
+| Experimento | Resultado |
+|---|---|
+| `sam local invoke` (1ª vez) | Duration: 59.87 ms · Init Duration: 0.05 ms · wall time: 45.78 s (inclui download da imagem Docker) |
+| `sam local invoke` (2ª vez) | Duration: 49.83 ms · Init Duration: 0.03 ms · wall time: 9.41 s (imagem já em cache) |
+| `start-api` sem `--warm-containers`, 3 chamadas | `invocacaoNesteAmbiente`: 1, 1, 1 |
+| `start-api --warm-containers LAZY`, 3 chamadas | `invocacaoNesteAmbiente`: 1, 2, 3 |
+| `demorar: true` com Timeout 3 | HTTP 502 — `Function 'GuiaTransporteFunction' timed out after 3 seconds` |
+| `demorar: true` com Timeout 10 | HTTP 201 — resposta em ~9.4 s (5 s de sleep + overhead do container) |
+| body sem `requisicaoId` | HTTP 400 — `{"erro": "requisicaoId obrigatório"}` |
+
+## Respostas
+
+
+**1. Por que a primeira invocação demorou mais que a segunda? O que acontece na fase de Init?**
+Na primeira invocação não existia ambiente de execução pronto (cold start). Na fase de Init, a plataforma cria o ambiente (no SAM local, sobe um container), inicia o runtime Python e executa o código fora do handler (imports e `contador = 0`). Só depois o handler roda. Na segunda invocação o ambiente já existe e é reaproveitado (warm start), então só o handler executa.
+Observado na minha execução: 1ª invocação wall time 45.78 s (inflado pelo download da imagem Docker), Duration 59.87 ms; 2ª invocação wall time 9.41 s (imagem já em cache), Duration 49.83 ms. O Init Duration reportado pelo SAM local foi ~0.05 ms (no ambiente real da AWS seria maior).
+
+**2. O que o campo `invocacaoNesteAmbiente` mostrou com e sem `--warm-containers`? O que isso diz sobre guardar estado numa variável global?**
+Com o ambiente reaproveitado, o contador cresce (1, 2, 3). Quando o ambiente é recriado a cada chamada, ele volta a 1. Ou seja, a variável global só sobrevive enquanto o ambiente for reaproveitado, e a plataforma não garante isso. Estado que precisa persistir (ou ser compartilhado entre instâncias) deve ficar fora da função, em banco de dados, cache ou armazenamento externo. A variável global serve no máximo como cache descartável.
+Observado na minha execução: sem `--warm-containers`, `invocacaoNesteAmbiente` foi 1, 1, 1 (container novo a cada chamada). Com `--warm-containers LAZY`, foi 1, 2, 3 (container reutilizado).
+
+**3. O que aconteceu com `demorar = true`? Qual é o tempo máximo de uma execução no Lambda e o que fazer com um trabalho mais longo?**
+A função dorme 5 s, mas o Timeout do template é 3 s, então a plataforma interrompe a execução e devolve erro de tempo limite (`Task timed out after 3.00 seconds`). Com Timeout 10 ela termina e responde 201. O máximo no Lambda é 15 minutos (900 s); conferir em [Cotas do Lambda](https://docs.aws.amazon.com/lambda/latest/dg/gettingstarted-limits.html). Trabalho mais longo deve ser quebrado em etapas menores (por exemplo, com filas e várias funções) ou ir para um serviço sem esse limite, como containers (ECS/Fargate) ou VMs.
+Observado na minha execução: com Timeout 3, recebi HTTP 502 e o log do SAM mostrou `Function 'GuiaTransporteFunction' timed out after 3 seconds`. Após mudar para Timeout 10 e rodar `sam build`, a mesma chamada retornou HTTP 201 em ~9.4 s.
+
+**4. Custo de 1 milhão de execuções com 128 MB e 100 ms (us-east-1)**
+
+- Requisições: 1.000.000 × US$ 0,20 / 1.000.000 = **US$ 0,20**
+- Computação: 128 MB = 0,125 GB; 100 ms = 0,1 s
+  - GB-s = 1.000.000 × 0,125 × 0,1 = **12.500 GB-s**
+  - 12.500 × US$ 0,0000166667 = **US$ 0,2083**
+- **Total ≈ US$ 0,41** (0,20 + 0,2083 = 0,4083), antes da faixa gratuita.
+
+**5. Em que parte do Rota Vital uma função assim faria sentido, e em qual não faria?**
+Faz sentido em tarefas curtas, sem estado e acionadas por evento ou com demanda irregular: gerar a guia de transporte quando uma requisição é criada, validar o pedido, enviar notificações. Paga-se só quando há uso e escala sozinha em picos. Não faria sentido onde há conexão contínua ou estado em memória: rastreamento em tempo real de uma entrega (conexões abertas, atualizações frequentes), processamentos longos acima do limite de tempo, ou componentes que exigem latência previsível sem cold start. O banco de dados do sistema também não é um bom candidato.
+
+## Uso de IA
+
+- **Ferramenta:** Claude (Anthropic).
+- **Finalidade:** apoio para montar a estrutura do projeto SAM, o `template.yaml` e o rascunho do README e do roteiro do vídeo.
+- **Ferramenta:** Antigravity (Google DeepMind).
+- **Finalidade:** executar os comandos (`sam build`, `sam local invoke`, `sam local start-api`, `curl`) e coletar evidências automaticamente.
+- **Como validei:** li e entendi o código do handler; rodei os comandos na minha máquina (`sam build`, `sam local invoke`, `sam local start-api`) e registrei os resultados em `evidencias/`; refiz a conta de custo à mão; reescrevi as respostas com as minhas palavras a partir do que observei. Sei explicar o código em sala.
